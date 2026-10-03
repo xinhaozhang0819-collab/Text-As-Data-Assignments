@@ -1,0 +1,202 @@
+---
+title: "Assignment 2"
+output: html_document
+date: "2026-10-02"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+```{r}
+library(tibble)
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(quanteda)
+library(quanteda.textstats)
+library(stringr)
+library(tidytext)
+library(tidyr)
+```
+
+
+# I. Raw-Count Sentiment Analysis (Week 03 Method)
+
+## Step 1
+```{r}
+file_a <- "texts/A07594__Circle_of_Commerce.txt"
+file_b <- "texts/B14801__Free_Trade.txt"
+
+text_a <- read_file(file_a)
+text_b <- read_file(file_b)
+
+texts <- tibble(
+  doc_title = c("Text A", "Text B"),
+  text = c(text_a, text_b)
+)
+```
+
+```{r}
+data("stop_words")
+
+custom_stopwords <- tibble(
+  word = c(
+    "vnto", "haue", "doo", "hath", "bee", "ye", "thee",
+    "hee", "shall", "hast", "doe", "beene", "thereof", "thus"
+  )
+)
+
+all_stopwords <- bind_rows(stop_words, custom_stopwords) %>%
+  distinct(word)
+
+tokens_clean <- texts %>%
+  mutate(text = str_replace_all(text, "ſ", "s")) %>%
+  unnest_tokens(word, text) %>%
+  mutate(word = str_to_lower(word)) %>%
+  anti_join(all_stopwords, by = "word")
+
+tokens_clean
+```
+
+## Step 2
+```{r}
+bing_sentiments <- get_sentiments("bing")
+
+tokens_sentiment <- tokens_clean %>%
+  inner_join(bing_sentiments, by = "word")
+
+tokens_sentiment
+```
+
+## Step 3
+```{r}
+raw_sentiment_totals <- tokens_sentiment %>%
+  group_by(doc_title) %>%
+  summarise(
+    positive = sum(sentiment == "positive"),
+    negative = sum(sentiment == "negative"),
+    net_sentiment = positive - negative
+  )
+
+raw_sentiment_totals
+```
+
+# II. TF-IDF–Weighted Sentiment Analysis 
+
+## Step 4
+```{r}
+txt_circle    <- read_file("texts/A07594__Circle_of_Commerce.txt")
+txt_free      <- read_file("texts/B14801__Free_Trade.txt")
+txt_third     <- read_file("texts/A06785.txt")
+
+texts_2 <- c(
+  "Circle_of_Commerce" = txt_circle,
+  "Free_Trade"         = txt_free,
+  "Third_Text_A06785"  = txt_third
+)
+
+texts_2 <- str_replace_all(texts_2, "ſ", "s")
+
+corp <- corpus(texts_2)
+
+toks <- tokens(
+  corp,
+  remove_punct   = TRUE,
+  remove_numbers = TRUE,
+  remove_symbols = TRUE
+)
+
+toks <- tokens_tolower(toks)
+
+custom_stop <- c(
+  "vnto", "haue", "doo", "hath", "bee", "ye", "thee", "hee", "shall", "hast",
+  "doe", "beene", "thereof", "thus"
+)
+
+toks <- tokens_remove(toks, pattern = c(stopwords("en"), custom_stop))
+
+dfm_mat <- dfm(toks)
+
+dfm_tfidf <- dfm_tfidf(dfm_mat)
+
+dfm_tfidf
+```
+## Step 5
+```{r}
+tfidf_df <- convert(dfm_tfidf, to = "data.frame")
+
+tfidf_tidy <- tfidf_df %>%
+  pivot_longer(
+    cols = -doc_id,
+    names_to = "word",
+    values_to = "tfidf"
+  ) %>%
+  filter(tfidf > 0) %>%
+  filter(doc_id %in% c("Circle_of_Commerce", "Free_Trade"))
+
+tfidf_tidy
+```
+
+## Step 6
+```{r}
+tfidf_sentiment <- tfidf_tidy %>%
+  inner_join(get_sentiments("bing"), by = "word") %>%
+  arrange(doc_id, desc(tfidf))
+
+tfidf_sentiment %>%
+  group_by(doc_id) %>%
+  slice_max(tfidf, n = 10) %>%
+  arrange(doc_id, desc(tfidf))
+```
+
+## Step 7
+```{r}
+tfidf_sentiment_summary <- tfidf_sentiment %>%
+  group_by(doc_id) %>%
+  summarise(
+    positive = sum(tfidf[sentiment == "positive"]),
+    negative = sum(tfidf[sentiment == "negative"]),
+    net_tfidf_sentiment = positive - negative
+  )
+
+tfidf_sentiment_summary
+```
+
+# III. Compare Raw vs. TF-IDF Sentiment
+```{r}
+raw_sentiment_totals_clean <- raw_sentiment_totals %>%
+  mutate(
+    doc_id = case_when(
+      doc_title == "Text A" ~ "Circle_of_Commerce",
+      doc_title == "Text B" ~ "Free_Trade",
+      TRUE ~ doc_title
+    )
+  ) %>%
+  rename(
+    raw_positive = positive,
+    raw_negative = negative,
+    raw_net_sentiment = net_sentiment
+  )
+
+tfidf_sentiment_summary_clean <- tfidf_sentiment_summary %>%
+  rename(
+    tfidf_positive = positive,
+    tfidf_negative = negative,
+    tfidf_net_sentiment = net_tfidf_sentiment
+  )
+
+final_sentiment_comparison <- raw_sentiment_totals_clean %>%
+  left_join(
+    tfidf_sentiment_summary_clean,
+    by = "doc_id"
+  )
+
+final_sentiment_comparison
+```
+```{r}
+write_csv(final_sentiment_comparison, "sentiment_comparison.csv")
+```
+
+
