@@ -1,0 +1,365 @@
+---
+title: "Data Exploration"
+output: html_document
+date: "2026-10-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+```{r}
+library(tidyverse)
+library(tidytext)
+library(readr)
+library(stringr)
+library(quanteda)
+library(quanteda.textstats)
+library(knitr)
+library(udpipe)
+```
+
+## Approach 1
+```{r}
+# Data Loading
+text_files <- list.files(
+  path = "texts",
+  pattern = "\\.txt$",
+  full.names = TRUE
+)
+
+length(text_files)
+
+texts_df <- tibble(
+  file_path = text_files,
+  document = tools::file_path_sans_ext(basename(text_files)),
+  text_original = map_chr(text_files, read_file)
+)
+
+texts_df %>%
+  select(document) %>%
+  kable(caption = "Documents in the corpus")
+```
+```{r}
+# Remove Long S
+texts_df <- texts_df %>%
+  mutate(
+    text_norm = str_replace_all(text_original, "ſ", "s"),
+    text_norm = str_to_lower(text_norm),
+    text_norm = str_replace_all(text_norm, "\\s+", " ")
+  )
+
+normalization_check <- texts_df %>%
+  summarise(
+    long_s_before = sum(str_count(text_original, "ſ")),
+    long_s_after = sum(str_count(text_norm, "ſ"))
+  )
+
+normalization_check
+```
+```{r}
+# DFM Construction
+corp <- corpus(
+  texts_df$text_norm,
+  docnames = texts_df$document
+)
+
+toks <- tokens(
+  corp,
+  remove_punct = TRUE,
+  remove_numbers = TRUE,
+  remove_symbols = TRUE
+)
+
+# Stop words Removal
+custom_stop <- c(
+  "vnto", "haue", "doo", "hath", "bee", "ye", "thee", "hee",
+  "shall", "hast", "doe", "beene", "thereof", "thus",
+  "unto", "have", "doth", "upon"
+)
+
+toks <- tokens_remove(
+  toks,
+  pattern = c(stopwords("en"), custom_stop)
+)
+
+dfm_mat <- dfm(toks)
+
+dfm_mat
+topfeatures(dfm_mat, 25)
+```
+```{r}
+# Compute TF-IDF weights and convert them to matrix
+dfm_tfidf_mat <- dfm_tfidf(dfm_mat)
+tfidf_matrix <- as.matrix(dfm_tfidf_mat)
+
+# Extract top 15 TF-IDF terms for each document
+top_tfidf_terms <- map_dfr(
+  rownames(tfidf_matrix),
+  function(doc) {
+    scores <- tfidf_matrix[doc, ]
+
+    tibble(
+      document = doc,
+      term = names(sort(scores, decreasing = TRUE))[1:15],
+      tfidf = sort(scores, decreasing = TRUE)[1:15]
+    )
+  }
+)
+
+top_tfidf_terms %>%
+  mutate(tfidf = round(tfidf, 3)) %>%
+  kable(
+    caption = "Top 15 TF-IDF Terms by Document",
+    col.names = c("Document", "Term", "TF-IDF")
+  )
+```
+
+## Approach 2
+```{r}
+# Remove very rare terms
+dfm_cor <- dfm_trim(dfm_mat, min_termfreq = 5)
+
+# Compute pairwise Pearson correlations between documents
+sim_r <- textstat_simil(
+  dfm_cor,
+  margin = "documents",
+  method = "correlation"
+)
+
+r_mat <- as.matrix(sim_r)
+```
+
+
+```{r, fig.width=6, fig.height=6}
+r_mat <- round(r_mat, 3)
+# Long format for ggplot
+heat_df <- as.data.frame(r_mat) %>%
+  rownames_to_column("doc_i") %>%
+  pivot_longer(
+    cols = -doc_i,
+    names_to = "doc_j",
+    values_to = "r"
+  )
+
+# Keep documents in matrix order, with the diagonal running from the upper-left corner to the lower-right corner
+doc_order <- rownames(r_mat)
+
+heat_df <- heat_df %>%
+  mutate(
+    doc_i = factor(doc_i, levels = rev(doc_order)),
+    doc_j = factor(doc_j, levels = doc_order)
+  )
+
+# Shorten long document names for display
+short_labels <- function(x) {
+  str_remove(x, "__.*$")
+}
+
+# Create the similarity heatmap
+ggplot(heat_df, aes(x = doc_j, y = doc_i, fill = r)) +
+  geom_tile() +
+  coord_fixed() +
+  scale_x_discrete(labels = short_labels) +
+  scale_y_discrete(labels = short_labels) +
+  scale_fill_gradient2(
+    low = "blue",
+    mid = "white",
+    high = "red",
+    midpoint = 0,
+    limits = c(-1, 1)
+  ) +
+  labs(
+    title = "Pearson Correlation Between Documents",
+    x = NULL,
+    y = NULL,
+    fill = "Pearson r"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    axis.text.y = element_text(size = 8),
+    panel.grid = element_blank()
+  )
+```
+
+```{r}
+# Extract each unique document pair
+pair_index <- which(upper.tri(r_mat), arr.ind = TRUE)
+
+pair_results <- tibble(
+  document_1 = rownames(r_mat)[pair_index[, 1]],
+  document_2 = colnames(r_mat)[pair_index[, 2]],
+  r = r_mat[pair_index]
+)
+
+# Two most similar pairs
+pair_results %>%
+  arrange(desc(r)) %>%
+  slice_head(n = 2)
+
+# Two least similar pairs
+pair_results %>%
+  arrange(r) %>%
+  slice_head(n = 2)
+```
+
+## Approach 3
+
+I selected A06791 and A93819 because they have the lowest Pearson correlation (r = 0.135) and different distinctive vocabulary.
+This comparison explores whether their lexical differences are accompanied by differences in syntactic structure.
+
+```{r}
+# Select two documents
+syntax_texts <- texts_df %>%
+  filter(document %in% c("A06791", "A93819")) %>%
+  mutate(
+    # Normalize long s and whitespace while preserving capitalization
+    text_syntax = text_original %>%
+      str_replace_all("ſ", "s") %>%
+      str_replace_all("\\s+", " ")
+  )
+
+dir.create("models", showWarnings = FALSE)
+
+model_files <- list.files(
+  "models",
+  pattern = "english-ewt.*\\.udpipe$",
+  full.names = TRUE
+)
+
+if (length(model_files) == 0) {
+  model_info <- udpipe_download_model(
+    language = "english-ewt",
+    model_dir = "models"
+  )
+  model_file <- model_info$file_model
+} else {
+  model_file <- model_files[1]
+}
+```
+
+```{r}
+# Load the model and annotate only the selected texts
+ud_model <- udpipe_load_model(model_file)
+
+anno_df <- map2_dfr(
+  syntax_texts$text_syntax,
+  syntax_texts$document,
+  function(txt, doc) {
+    udpipe_annotate(
+      ud_model,
+      x = txt,
+      doc_id = doc
+    ) %>%
+      as.data.frame()
+  }
+) %>%
+  rename(document = doc_id)
+```
+
+```{r}
+# Identify syntactic features
+syntax_df <- anno_df %>%
+mutate(
+is_word = upos != "PUNCT", 
+
+
+is_clause = (upos %in% c("VERB", "AUX")) &
+            str_detect(coalesce(feats, ""), "VerbForm=Fin"),
+
+# Dependent clause
+is_dep_clause = dep_rel %in% c(
+  "advcl", 
+  "ccomp",
+  "xcomp",
+  "acl",
+  "acl:relcl"
+),
+
+is_coord = dep_rel %in% c("conj", "cc"),
+
+# Nominal complexity: these relations make noun phrases more complex
+is_complex_nominal = dep_rel %in% c(
+  "amod",
+  "nmod",
+  "compound", 
+  "appos"
+)
+
+)
+
+# Aggregate features by sentence
+sentence_df <- syntax_df %>%
+  filter(is_word) %>%
+  group_by(document, paragraph_id, sentence_id) %>%
+  summarise(
+    sentence = first(sentence),
+    words = n(),
+    clauses = sum(is_clause, na.rm = TRUE),
+    dep_clauses = sum(is_dep_clause),
+    coordination = sum(is_coord),
+    complex_nominals = sum(is_complex_nominal),
+    .groups = "drop"
+  )
+
+# Calculate document-level measures
+syntax_summary <- sentence_df %>%
+  group_by(document) %>%
+  summarise(
+    sentences = n(),
+    total_words = sum(words),
+    clauses = sum(clauses),
+    dependent_clauses = sum(dep_clauses),
+    coordination = sum(coordination),
+    complex_nominals = sum(complex_nominals),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    MLS = total_words / sentences,
+    C_per_S = clauses / sentences,
+    DC_per_C = if_else(clauses > 0, dependent_clauses / clauses, NA_real_),
+    DC_per_S = dependent_clauses / sentences,
+    Coord_per_C = if_else(clauses > 0, coordination / clauses, NA_real_),
+    Coord_per_S = coordination / sentences,
+    CN_per_C = if_else(clauses > 0, complex_nominals / clauses, NA_real_),
+    CN_per_S = complex_nominals / sentences
+  )
+
+# Combine all measures
+all_measures <- syntax_summary %>%
+  select(
+    document, MLS, C_per_S, DC_per_C, DC_per_S,
+    Coord_per_C, Coord_per_S, CN_per_C, CN_per_S
+  )
+
+# Display a clearly formatted HTML table
+knitr::kable(
+  all_measures,
+  format = "html",
+  digits = 2,
+  align = c("l", rep("r", 8)),
+  caption = "Syntactic Complexity Comparison",
+  col.names = c(
+    "Document", "MLS", "C/S", "DC/C", "DC/S",
+    "Coord/C", "Coord/S", "CN/C", "CN/S"
+  ),
+  table.attr = 'style="width:100%; border-collapse:collapse;"'
+)
+```
+```{r}
+example_candidates <- sentence_df %>%
+  group_by(document) %>%
+  arrange(desc(dep_clauses), desc(words), .by_group = TRUE) %>%
+  slice_head(n = 3) %>%
+  ungroup() %>%
+  select(
+    document, sentence, words, clauses,
+    dep_clauses, coordination, complex_nominals
+  )
+
+example_candidates %>%
+  kable(caption = "Candidate Sentences for Close Reading")
+```
+
